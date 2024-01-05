@@ -161,6 +161,17 @@ export class FrameManager extends EventEmitter<FrameManagerEvents> {
       this.#onFrameAttached(session, event.frameId, event.parentFrameId);
     });
     session.on('Page.frameNavigated', async event => {
+      if (
+        (process.env['donkey-pp-runtime-white-list'] || '')
+          .split(',')
+          .map(v => {
+            return `https://${v}`;
+          })
+          .includes(event.frame.securityOrigin)
+      ) {
+        // console.log('@@@@', event.frame.securityOrigin, event.frame.domainAndRegistry)
+        await session.send('Runtime.disable');
+      }
       this.#frameNavigatedReceived.add(event.frame.id);
       await this.#frameTreeHandled?.valueOrThrow();
       void this.#onFrameNavigated(event.frame, event.type);
