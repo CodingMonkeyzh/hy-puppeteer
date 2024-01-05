@@ -1,80 +1,51 @@
 /**
- * Copyright 2017 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * @license
+ * Copyright 2017 Google Inc.
+ * SPDX-License-Identifier: Apache-2.0
  */
 
-import {Protocol} from 'devtools-protocol';
+import type {Protocol} from 'devtools-protocol';
 
-import {Page} from '../api/Page.js';
+import {type CDPSession, CDPSessionEvent} from '../api/CDPSession.js';
+import {FrameEvent} from '../api/Frame.js';
+import {EventEmitter} from '../common/EventEmitter.js';
+import type {TimeoutSettings} from '../common/TimeoutSettings.js';
+import {debugError, PuppeteerURL, UTILITY_WORLD_NAME} from '../common/util.js';
 import {assert} from '../util/assert.js';
+import {Deferred} from '../util/Deferred.js';
+import {disposeSymbol} from '../util/disposable.js';
 import {isErrorLike} from '../util/ErrorLike.js';
 
-import {
-  CDPSession,
-  CDPSessionEmittedEvents,
-  isTargetClosedError,
-} from './Connection.js';
+import {CdpCDPSession} from './CDPSession.js';
+import {isTargetClosedError} from './Connection.js';
 import {DeviceRequestPromptManager} from './DeviceRequestPrompt.js';
-import {EventEmitter} from './EventEmitter.js';
 import {ExecutionContext} from './ExecutionContext.js';
-import {Frame, FrameEmittedEvents} from './Frame.js';
+import {CdpFrame} from './Frame.js';
+import type {FrameManagerEvents} from './FrameManagerEvents.js';
+import {FrameManagerEvent} from './FrameManagerEvents.js';
 import {FrameTree} from './FrameTree.js';
-import {IsolatedWorld} from './IsolatedWorld.js';
+import type {IsolatedWorld} from './IsolatedWorld.js';
 import {MAIN_WORLD, PUPPETEER_WORLD} from './IsolatedWorlds.js';
 import {NetworkManager} from './NetworkManager.js';
-import {CDPTarget} from './Target.js';
-import {TimeoutSettings} from './TimeoutSettings.js';
-import {debugError, PuppeteerURL} from './util.js';
+import type {CdpPage} from './Page.js';
+import type {CdpTarget} from './Target.js';
 
-/**
- * @internal
- */
-export const UTILITY_WORLD_NAME = '__puppeteer_utility_world__';
-
-/**
- * We use symbols to prevent external parties listening to these events.
- * They are internal to Puppeteer.
- *
- * @internal
- */
-export const FrameManagerEmittedEvents = {
-  FrameAttached: Symbol('FrameManager.FrameAttached'),
-  FrameNavigated: Symbol('FrameManager.FrameNavigated'),
-  FrameDetached: Symbol('FrameManager.FrameDetached'),
-  FrameSwapped: Symbol('FrameManager.FrameSwapped'),
-  LifecycleEvent: Symbol('FrameManager.LifecycleEvent'),
-  FrameNavigatedWithinDocument: Symbol(
-    'FrameManager.FrameNavigatedWithinDocument'
-  ),
-};
+const TIME_FOR_WAITING_FOR_SWAP = 100; // ms.
 
 /**
  * A frame manager manages the frames for a given {@link Page | page}.
  *
  * @internal
  */
-export class FrameManager extends EventEmitter {
-  #page: Page;
+export class FrameManager extends EventEmitter<FrameManagerEvents> {
+  #page: CdpPage;
   #networkManager: NetworkManager;
   #timeoutSettings: TimeoutSettings;
   #contextIdToContext = new Map<string, ExecutionContext>();
   #isolatedWorlds = new Set<string>();
   #client: CDPSession;
-  /**
-   * @internal
-   */
-  _frameTree = new FrameTree<Frame>();
+
+  _frameTree = new FrameTree<CdpFrame>();
 
   /**
    * Set of frame IDs stored to indicate if a frame has received a
@@ -87,6 +58,8 @@ export class FrameManager extends EventEmitter {
     CDPSession,
     DeviceRequestPromptManager
   >();
+
+  #frameTreeHandled?: Deferred<void>;
 
   get timeoutSettings(): TimeoutSettings {
     return this.#timeoutSettings;
@@ -102,97 +75,158 @@ export class FrameManager extends EventEmitter {
 
   constructor(
     client: CDPSession,
-    page: Page,
+    page: CdpPage,
     ignoreHTTPSErrors: boolean,
     timeoutSettings: TimeoutSettings
   ) {
     super();
     this.#client = client;
     this.#page = page;
-    this.#networkManager = new NetworkManager(client, ignoreHTTPSErrors, this);
+    this.#networkManager = new NetworkManager(ignoreHTTPSErrors, this);
     this.#timeoutSettings = timeoutSettings;
     this.setupEventListeners(this.#client);
-    client.once(CDPSessionEmittedEvents.Disconnected, () => {
-      const mainFrame = this._frameTree.getMainFrame();
-      if (mainFrame) {
-        this.#removeFramesRecursively(mainFrame);
-      }
+    client.once(CDPSessionEvent.Disconnected, () => {
+      this.#onClientDisconnect().catch(debugError);
     });
   }
 
+  /**
+   * Called when the frame's client is disconnected. We don't know if the
+   * disconnect means that the frame is removed or if it will be replaced by a
+   * new frame. Therefore, we wait for a swap event.
+   */
+  async #onClientDisconnect() {
+    const mainFrame = this._frameTree.getMainFrame();
+    if (!mainFrame) {
+      return;
+    }
+    for (const child of mainFrame.childFrames()) {
+      this.#removeFramesRecursively(child);
+    }
+    const swapped = Deferred.create<void>({
+      timeout: TIME_FOR_WAITING_FOR_SWAP,
+      message: 'Frame was not swapped',
+    });
+    mainFrame.once(FrameEvent.FrameSwappedByActivation, () => {
+      swapped.resolve();
+    });
+    try {
+      await swapped.valueOrThrow();
+    } catch (err) {
+      this.#removeFramesRecursively(mainFrame);
+    }
+  }
+
+  /**
+   * When the main frame is replaced by another main frame,
+   * we maintain the main frame object identity while updating
+   * its frame tree and ID.
+   */
+  async swapFrameTree(client: CDPSession): Promise<void> {
+    this.#onExecutionContextsCleared(this.#client);
+
+    this.#client = client;
+    assert(
+      this.#client instanceof CdpCDPSession,
+      'CDPSession is not an instance of CDPSessionImpl.'
+    );
+    const frame = this._frameTree.getMainFrame();
+    if (frame) {
+      this.#frameNavigatedReceived.add(this.#client._target()._targetId);
+      this._frameTree.removeFrame(frame);
+      frame.updateId(this.#client._target()._targetId);
+      frame.mainRealm().clearContext();
+      frame.isolatedRealm().clearContext();
+      this._frameTree.addFrame(frame);
+      frame.updateClient(client, true);
+    }
+    this.setupEventListeners(client);
+    client.once(CDPSessionEvent.Disconnected, () => {
+      this.#onClientDisconnect().catch(debugError);
+    });
+    await this.initialize(client);
+    await this.#networkManager.addClient(client);
+    if (frame) {
+      frame.emit(FrameEvent.FrameSwappedByActivation, undefined);
+    }
+  }
+
+  async registerSpeculativeSession(client: CdpCDPSession): Promise<void> {
+    await this.#networkManager.addClient(client);
+  }
+
   private setupEventListeners(session: CDPSession) {
-    session.on('Page.frameAttached', event => {
+    session.on('Page.frameAttached', async event => {
+      await this.#frameTreeHandled?.valueOrThrow();
       this.#onFrameAttached(session, event.frameId, event.parentFrameId);
     });
     session.on('Page.frameNavigated', async event => {
-      // bypass cloudflare Turnstile challenges
-      // if (['https://challenges.cloudflare.com', 'https://geo.captcha-delivery.com'].includes(event.frame.securityOrigin)) {
-      if (
-        (process.env['donkey-pp-runtime-white-list'] || '')
-          .split(',')
-          .map(v => {
-            return `https://${v}`;
-          })
-          .includes(event.frame.securityOrigin)
-      ) {
-        // console.log('@@@@', event.frame.securityOrigin, event.frame.domainAndRegistry)
-        await session.send('Runtime.disable');
-      }
       this.#frameNavigatedReceived.add(event.frame.id);
-      void this.#onFrameNavigated(event.frame);
+      await this.#frameTreeHandled?.valueOrThrow();
+      void this.#onFrameNavigated(event.frame, event.type);
     });
-    session.on('Page.navigatedWithinDocument', event => {
+    session.on('Page.navigatedWithinDocument', async event => {
+      await this.#frameTreeHandled?.valueOrThrow();
       this.#onFrameNavigatedWithinDocument(event.frameId, event.url);
     });
     session.on(
       'Page.frameDetached',
-      (event: Protocol.Page.FrameDetachedEvent) => {
+      async (event: Protocol.Page.FrameDetachedEvent) => {
+        await this.#frameTreeHandled?.valueOrThrow();
         this.#onFrameDetached(
           event.frameId,
           event.reason as Protocol.Page.FrameDetachedEventReason
         );
       }
     );
-    session.on('Page.frameStartedLoading', event => {
+    session.on('Page.frameStartedLoading', async event => {
+      await this.#frameTreeHandled?.valueOrThrow();
       this.#onFrameStartedLoading(event.frameId);
     });
-    session.on('Page.frameStoppedLoading', event => {
+    session.on('Page.frameStoppedLoading', async event => {
+      await this.#frameTreeHandled?.valueOrThrow();
       this.#onFrameStoppedLoading(event.frameId);
     });
-    session.on('Runtime.executionContextCreated', event => {
+    session.on('Runtime.executionContextCreated', async event => {
+      await this.#frameTreeHandled?.valueOrThrow();
       this.#onExecutionContextCreated(event.context, session);
     });
-    session.on('Runtime.executionContextDestroyed', event => {
+    session.on('Runtime.executionContextDestroyed', async event => {
+      await this.#frameTreeHandled?.valueOrThrow();
       this.#onExecutionContextDestroyed(event.executionContextId, session);
     });
-    session.on('Runtime.executionContextsCleared', () => {
+    session.on('Runtime.executionContextsCleared', async () => {
+      await this.#frameTreeHandled?.valueOrThrow();
       this.#onExecutionContextsCleared(session);
     });
-    session.on('Page.lifecycleEvent', event => {
+    session.on('Page.lifecycleEvent', async event => {
+      await this.#frameTreeHandled?.valueOrThrow();
       this.#onLifecycleEvent(event);
     });
   }
 
-  async initialize(client: CDPSession = this.#client): Promise<void> {
+  async initialize(client: CDPSession): Promise<void> {
     try {
-      const result = await Promise.all([
-        client.send('Page.enable'),
-        client.send('Page.getFrameTree'),
-      ]);
-
-      const {frameTree} = result[1];
-      this.#handleFrameTree(client, frameTree);
+      this.#frameTreeHandled?.resolve();
+      this.#frameTreeHandled = Deferred.create();
+      // We need to schedule all these commands while the target is paused,
+      // therefore, it needs to happen synchroniously. At the same time we
+      // should not start processing execution context and frame events before
+      // we received the initial information about the frame tree.
       await Promise.all([
+        this.#networkManager.addClient(client),
+        client.send('Page.enable'),
+        client.send('Page.getFrameTree').then(({frameTree}) => {
+          this.#handleFrameTree(client, frameTree);
+          this.#frameTreeHandled?.resolve();
+        }),
         client.send('Page.setLifecycleEventsEnabled', {enabled: true}),
         client.send('Runtime.enable').then(() => {
           return this.#createIsolatedWorld(client, UTILITY_WORLD_NAME);
         }),
-        // TODO: Network manager is not aware of OOP iframes yet.
-        client === this.#client
-          ? this.#networkManager.initialize()
-          : Promise.resolve(),
       ]);
     } catch (error) {
+      this.#frameTreeHandled?.resolve();
       // The target might have been closed before the initialization finished.
       if (isErrorLike(error) && isTargetClosedError(error)) {
         return;
@@ -218,25 +252,25 @@ export class FrameManager extends EventEmitter {
     return this.#contextIdToContext.get(`${session.id()}:${contextId}`);
   }
 
-  page(): Page {
+  page(): CdpPage {
     return this.#page;
   }
 
-  mainFrame(): Frame {
+  mainFrame(): CdpFrame {
     const mainFrame = this._frameTree.getMainFrame();
     assert(mainFrame, 'Requesting main frame too early!');
     return mainFrame;
   }
 
-  frames(): Frame[] {
+  frames(): CdpFrame[] {
     return Array.from(this._frameTree.frames());
   }
 
-  frame(frameId: string): Frame | null {
+  frame(frameId: string): CdpFrame | null {
     return this._frameTree.getById(frameId) || null;
   }
 
-  onAttachedToTarget(target: CDPTarget): void {
+  onAttachedToTarget(target: CdpTarget): void {
     if (target._getTargetInfo().type !== 'iframe') {
       return;
     }
@@ -246,12 +280,9 @@ export class FrameManager extends EventEmitter {
       frame.updateClient(target._session()!);
     }
     this.setupEventListeners(target._session()!);
-    void this.initialize(target._session());
+    void this.initialize(target._session()!);
   }
 
-  /**
-   * @internal
-   */
   _deviceRequestPromptManager(client: CDPSession): DeviceRequestPromptManager {
     let manager = this.#deviceRequestPromptManagerMap.get(client);
     if (manager === undefined) {
@@ -267,8 +298,8 @@ export class FrameManager extends EventEmitter {
       return;
     }
     frame._onLifecycleEvent(event.loaderId, event.name);
-    this.emit(FrameManagerEmittedEvents.LifecycleEvent, frame);
-    frame.emit(FrameEmittedEvents.LifecycleEvent);
+    this.emit(FrameManagerEvent.LifecycleEvent, frame);
+    frame.emit(FrameEvent.LifecycleEvent, undefined);
   }
 
   #onFrameStartedLoading(frameId: string): void {
@@ -285,8 +316,8 @@ export class FrameManager extends EventEmitter {
       return;
     }
     frame._onLoadingStopped();
-    this.emit(FrameManagerEmittedEvents.LifecycleEvent, frame);
-    frame.emit(FrameEmittedEvents.LifecycleEvent);
+    this.emit(FrameManagerEvent.LifecycleEvent, frame);
+    frame.emit(FrameEvent.LifecycleEvent, undefined);
   }
 
   #handleFrameTree(
@@ -301,7 +332,7 @@ export class FrameManager extends EventEmitter {
       );
     }
     if (!this.#frameNavigatedReceived.has(frameTree.frame.id)) {
-      void this.#onFrameNavigated(frameTree.frame);
+      void this.#onFrameNavigated(frameTree.frame, 'Navigation');
     } else {
       this.#frameNavigatedReceived.delete(frameTree.frame.id);
     }
@@ -331,12 +362,15 @@ export class FrameManager extends EventEmitter {
       return;
     }
 
-    frame = new Frame(this, frameId, parentFrameId, session);
+    frame = new CdpFrame(this, frameId, parentFrameId, session);
     this._frameTree.addFrame(frame);
-    this.emit(FrameManagerEmittedEvents.FrameAttached, frame);
+    this.emit(FrameManagerEvent.FrameAttached, frame);
   }
 
-  async #onFrameNavigated(framePayload: Protocol.Page.Frame): Promise<void> {
+  async #onFrameNavigated(
+    framePayload: Protocol.Page.Frame,
+    navigationType: Protocol.Page.NavigationType
+  ): Promise<void> {
     const frameId = framePayload.id;
     const isMainFrame = !framePayload.parentId;
 
@@ -357,15 +391,15 @@ export class FrameManager extends EventEmitter {
         frame._id = frameId;
       } else {
         // Initial main frame navigation.
-        frame = new Frame(this, frameId, undefined, this.#client);
+        frame = new CdpFrame(this, frameId, undefined, this.#client);
       }
       this._frameTree.addFrame(frame);
     }
 
     frame = await this._frameTree.waitForFrame(frameId);
     frame._navigated(framePayload);
-    this.emit(FrameManagerEmittedEvents.FrameNavigated, frame);
-    frame.emit(FrameEmittedEvents.FrameNavigated);
+    this.emit(FrameManagerEvent.FrameNavigated, frame);
+    frame.emit(FrameEvent.FrameNavigated, navigationType);
   }
 
   async #createIsolatedWorld(session: CDPSession, name: string): Promise<void> {
@@ -383,7 +417,7 @@ export class FrameManager extends EventEmitter {
     await Promise.all(
       this.frames()
         .filter(frame => {
-          return frame._client() === session;
+          return frame.client === session;
         })
         .map(frame => {
           // Frames might be removed before we send this, so we don't want to
@@ -407,10 +441,10 @@ export class FrameManager extends EventEmitter {
       return;
     }
     frame._navigatedWithinDocument(url);
-    this.emit(FrameManagerEmittedEvents.FrameNavigatedWithinDocument, frame);
-    frame.emit(FrameEmittedEvents.FrameNavigatedWithinDocument);
-    this.emit(FrameManagerEmittedEvents.FrameNavigated, frame);
-    frame.emit(FrameEmittedEvents.FrameNavigated);
+    this.emit(FrameManagerEvent.FrameNavigatedWithinDocument, frame);
+    frame.emit(FrameEvent.FrameNavigatedWithinDocument, undefined);
+    this.emit(FrameManagerEvent.FrameNavigated, frame);
+    frame.emit(FrameEvent.FrameNavigated, 'Navigation');
   }
 
   #onFrameDetached(
@@ -418,16 +452,20 @@ export class FrameManager extends EventEmitter {
     reason: Protocol.Page.FrameDetachedEventReason
   ): void {
     const frame = this.frame(frameId);
-    if (reason === 'remove') {
-      // Only remove the frame if the reason for the detached event is
-      // an actual removement of the frame.
-      // For frames that become OOP iframes, the reason would be 'swap'.
-      if (frame) {
+    if (!frame) {
+      return;
+    }
+    switch (reason) {
+      case 'remove':
+        // Only remove the frame if the reason for the detached event is
+        // an actual removement of the frame.
+        // For frames that become OOP iframes, the reason would be 'swap'.
         this.#removeFramesRecursively(frame);
-      }
-    } else if (reason === 'swap') {
-      this.emit(FrameManagerEmittedEvents.FrameSwapped, frame);
-      frame?.emit(FrameEmittedEvents.FrameSwapped);
+        break;
+      case 'swap':
+        this.emit(FrameManagerEvent.FrameSwapped, frame);
+        frame.emit(FrameEvent.FrameSwapped, undefined);
+        break;
     }
   }
 
@@ -441,7 +479,7 @@ export class FrameManager extends EventEmitter {
     let world: IsolatedWorld | undefined;
     if (frame) {
       // Only care about execution contexts created for the current session.
-      if (frame._client() !== session) {
+      if (frame.client !== session) {
         return;
       }
       if (contextPayload.auxData && contextPayload.auxData['isDefault']) {
@@ -456,8 +494,12 @@ export class FrameManager extends EventEmitter {
         world = frame.worlds[PUPPETEER_WORLD];
       }
     }
+    // If there is no world, the context is not meant to be handled by us.
+    if (!world) {
+      return;
+    }
     const context = new ExecutionContext(
-      frame?._client() || this.#client,
+      frame?.client || this.#client,
       contextPayload,
       world
     );
@@ -497,13 +539,13 @@ export class FrameManager extends EventEmitter {
     }
   }
 
-  #removeFramesRecursively(frame: Frame): void {
+  #removeFramesRecursively(frame: CdpFrame): void {
     for (const child of frame.childFrames()) {
       this.#removeFramesRecursively(child);
     }
-    frame._detach();
+    frame[disposeSymbol]();
     this._frameTree.removeFrame(frame);
-    this.emit(FrameManagerEmittedEvents.FrameDetached, frame);
-    frame.emit(FrameEmittedEvents.FrameDetached, frame);
+    this.emit(FrameManagerEvent.FrameDetached, frame);
+    frame.emit(FrameEvent.FrameDetached, frame);
   }
 }
