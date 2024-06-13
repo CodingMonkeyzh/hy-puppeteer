@@ -350,7 +350,8 @@ export class ChromeTargetManager
           parentSession instanceof CDPSession ? parentSession : undefined
         );
 
-    if (this.#targetFilterCallback && !this.#targetFilterCallback(target)) {
+    // @@@ ignore worker
+    if (['service_worker', 'shared_worker', 'worker'].includes(targetInfo.type) || (this.#targetFilterCallback && !this.#targetFilterCallback(target))) {
       this.#ignoredTargets.add(targetInfo.targetId);
       this.#finishInitializationIfReady(targetInfo.targetId);
       await silentDetach();
