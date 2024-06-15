@@ -403,6 +403,9 @@ export function addPageBinding(type: string, name: string): void {
   });
   // @ts-expect-error: In a different context.
   globalThis[name][Symbol.toStringTag] = 'PuppeteerBinding';
+  Object.defineProperty(globalThis, name, {
+    enumerable: false,
+  });
 }
 
 /**
