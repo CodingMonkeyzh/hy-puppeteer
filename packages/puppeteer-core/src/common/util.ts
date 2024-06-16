@@ -491,6 +491,9 @@ export function addPageBinding(type: string, name: string): void {
       });
     },
   });
+  Object.defineProperty(globalThis, name, {
+    enumerable: false,
+  });
 }
 
 /**
